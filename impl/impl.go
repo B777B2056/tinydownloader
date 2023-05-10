@@ -1,6 +1,7 @@
 package impl
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -41,7 +42,8 @@ func NewDownloader(url string, savePath string, concurrencyN int) *Downloader {
 func (d *Downloader) Start() {
 	isExits, err := utils.IsFileExits(d.filePath)
 	if err != nil {
-		panic(err)
+		fmt.Printf("%s", err.Error())
+		return
 	}
 	if isExits {
 		fmt.Print("File exits, no need to download\n")
@@ -49,23 +51,31 @@ func (d *Downloader) Start() {
 	}
 	fmt.Print("Start downloading...\n")
 	if err := utils.CreateFile(d.filePath); err != nil {
-		panic(err)
+		fmt.Printf("Create file failed: %s", err.Error())
+		return
 	}
 	canPartial, err := d.checkServerSupportPartialReq()
 	if err != nil {
-		panic(err)
+		fmt.Printf("HTTP HEAD method failed: %s", err.Error())
+		return
 	}
 	if canPartial {
-		d.partialDownload()
+		if err := d.partialDownload(); err != nil {
+			fmt.Printf("Download failed: %s", err.Error())
+			return
+		}
 	} else {
-		d.fullDownload()
+		if err := d.fullDownload(); err != nil {
+			fmt.Printf("Download failed: %s", err.Error())
+			return
+		}
 	}
 	// 校验文件完整性
-	err = d.checkIntegrity()
-	if err != nil {
-		panic(err)
+	if err := d.checkIntegrity(); err != nil {
+		fmt.Printf("Create file failed: %s", err.Error())
+	} else {
+		fmt.Print("Done\n")
 	}
-	fmt.Print("Done\n")
 }
 
 func (d *Downloader) checkServerSupportPartialReq() (bool, error) {
@@ -87,40 +97,60 @@ func (d *Downloader) checkServerSupportPartialReq() (bool, error) {
 	return true, nil
 }
 
-func (d *Downloader) fullDownload() {
+func (d *Downloader) fullDownload() error {
 	// 发送http请求
 	resp, err := http.Get(d.url)
 	if err != nil {
-		panic(err)
+		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("status code is %d", resp.StatusCode)
+	}
 	// 写入文件
 	file, err := os.OpenFile(d.filePath, os.O_WRONLY|os.O_CREATE, 0666)
 	if err != nil {
-		panic(err)
+		return err
 	}
 	defer file.Close()
 	_, err = io.Copy(io.MultiWriter(file, d.bar), resp.Body)
-	if err != nil {
-		panic(err)
-	}
+	return err
 }
 
-func (d *Downloader) partialDownload() {
+func (d *Downloader) partialDownload() error {
+	// 错误处理相关
+	ctx, stop := context.WithCancel(context.Background())
+	errChan := make(chan error, 1)
+	defer stop()
+	// 偏移量
 	var offset int64 = 0
+	// 每个go程所分配到的文件大小
 	partSize := d.fileSize / int64(d.concurrencyN)
 	wg.Add(d.concurrencyN)
 	for i := 0; i < d.concurrencyN; i++ {
 		go func(i int, offset int64) {
 			defer wg.Done()
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
 			if err := d.partialDownloadImpl(offset, partSize, i); err != nil {
-				panic(err)
+				select {
+				case errChan <- fmt.Errorf("partial download failed: %s", err.Error()):
+				default:
+				}
+				stop()
 			}
 		}(i, offset)
 		offset += partSize
 	}
 	wg.Wait()
-	d.mergeFile()
+	if ctx.Err() != nil {
+		return <-errChan
+	}
+	// 合并各部分文件
+	return d.mergeFile()
 }
 
 func (d *Downloader) partialDownloadImpl(offset, partSize int64, i int) error {
@@ -138,35 +168,42 @@ func (d *Downloader) partialDownloadImpl(offset, partSize int64, i int) error {
 	if err != nil {
 		return err
 	}
+	if resp.StatusCode != http.StatusPartialContent {
+		return fmt.Errorf("status code is %d", resp.StatusCode)
+	}
 	defer resp.Body.Close()
-	return d.partialWriteFile(offset, resp, i)
+	return d.partialWriteFile(resp, i)
 }
 
-func (d *Downloader) partialWriteFile(startPos int64, resp *http.Response, i int) error {
+func (d *Downloader) partialWriteFile(resp *http.Response, i int) error {
 	tmpFile, err := os.OpenFile(fmt.Sprintf("%s.tmp.%d", d.filePath, i), os.O_WRONLY|os.O_CREATE, 0666)
 	if err != nil {
-		panic(err)
+		return err
 	}
 	defer tmpFile.Close()
 	_, err = io.Copy(io.MultiWriter(tmpFile, d.bar), resp.Body)
 	return err
 }
 
-func (d *Downloader) mergeFile() {
+func (d *Downloader) mergeFile() error {
 	file, err := os.OpenFile(d.filePath, os.O_WRONLY|os.O_APPEND, 0666)
 	if err != nil {
-		panic(err)
+		return err
 	}
 	defer file.Close()
 	for i := 0; i < d.concurrencyN; i++ {
 		tmpFile, err := os.Open(fmt.Sprintf("%s.tmp.%d", d.filePath, i))
 		if err != nil {
-			panic(err)
+			return err
 		}
-		io.Copy(file, tmpFile)
+		_, err = io.Copy(file, tmpFile)
 		tmpFile.Close()
+		if err != nil {
+			return err
+		}
 		os.Remove(tmpFile.Name())
 	}
+	return nil
 }
 
 func (d *Downloader) checkIntegrity() error {
